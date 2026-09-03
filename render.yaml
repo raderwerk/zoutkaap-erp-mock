@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: zoutkaap-erp-mock
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ZOUTKAAP_API_KEY
+        generateValue: true
+      - key: ZOUTKAAP_DATABASE
+        value: /tmp/zoutkaap.sqlite3

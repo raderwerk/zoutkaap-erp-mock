@@ -19,6 +19,24 @@ De API draait vervolgens op `http://localhost:8000`. De interactieve documentati
 
 Standaard wordt de SQLite-database geschreven naar `instance/zoutkaap.sqlite3`. Dit pad is instelbaar met `ZOUTKAAP_DATABASE`.
 
+## Publiek als preview uitrollen
+
+De repository bevat een `Dockerfile` en een Render Blueprint (`render.yaml`). Daarmee kan een
+mens de service in één handeling als publieke preview uitrollen, zonder lokaal een image te
+bouwen:
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/raderwerk/zoutkaap-erp-mock)
+
+1. Klik op **Deploy to Render**, kies de branch van de pull request en bevestig de Blueprint.
+2. Wacht tot `/health` op de door Render toegewezen URL `200 OK` geeft.
+3. Kopieer de publieke URL naar een attachment bij WV-171. De automatisch gegenereerde waarde
+   van `ZOUTKAAP_API_KEY` staat in de omgevingsvariabelen van de Render-service en is nodig voor
+   de bedrijfsroutes.
+
+De gratis preview gebruikt tijdelijke SQLite-opslag. Een nieuwe instantie seedt zichzelf daarom
+automatisch met de 24 testartikelen. Dit manifest is alleen deployvoorbereiding; agents voeren de
+deploy niet zelf uit.
+
 ## Authenticatie
 
 Alle bedrijfs- en beheerroutes vereisen de header:

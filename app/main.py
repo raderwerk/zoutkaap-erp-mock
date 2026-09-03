@@ -255,12 +255,20 @@ def create_order(request: OrderRequest) -> Order:
         for line in request.lines:
             quantities[line.sku] = quantities.get(line.sku, 0) + line.quantity
         for sku, quantity in quantities.items():
-            row = connection.execute(
-                "SELECT stock FROM products WHERE sku = ?", (sku,)
-            ).fetchone()
-            if row is None:
-                raise HTTPException(status_code=404, detail=f"Article {sku} not found")
-            if row["stock"] < quantity:
+            cursor = connection.execute(
+                """
+                UPDATE products
+                SET stock = stock - ?
+                WHERE sku = ? AND stock >= ?
+                """,
+                (quantity, sku, quantity),
+            )
+            if cursor.rowcount == 0:
+                exists = connection.execute(
+                    "SELECT 1 FROM products WHERE sku = ?", (sku,)
+                ).fetchone()
+                if exists is None:
+                    raise HTTPException(status_code=404, detail=f"Article {sku} not found")
                 raise HTTPException(status_code=409, detail=f"Insufficient stock for {sku}")
         cursor = connection.execute("INSERT INTO orders(status) VALUES ('received')")
         order_id = cursor.lastrowid
@@ -268,11 +276,6 @@ def create_order(request: OrderRequest) -> Order:
         for line in request.lines:
             connection.execute(
                 "INSERT INTO order_lines VALUES (?, ?, ?)", (order_id, line.sku, line.quantity)
-            )
-        for sku, quantity in quantities.items():
-            connection.execute(
-                "UPDATE products SET stock = stock - ? WHERE sku = ?",
-                (quantity, sku),
             )
     return Order(id=order_id, lines=request.lines)
 

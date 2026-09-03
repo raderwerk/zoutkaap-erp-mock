@@ -1,10 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from openapi_spec_validator import validate
 
-from app.main import API_KEY, app, seed_database, set_database_path
+from app.main import API_KEY, app, database, seed_database, set_database_path
 
 AUTH = {"X-API-Key": API_KEY}
 
@@ -81,6 +82,30 @@ def test_order_combines_duplicate_lines_before_stock_check(client: TestClient) -
     )
     assert response.status_code == 409
     assert client.get("/inventory/ZK-LAARS-004", headers=AUTH).json()["quantity"] == 4
+
+
+def test_concurrent_orders_cannot_make_inventory_negative(client: TestClient) -> None:
+    sku = "ZK-LAARS-004"
+
+    def place_order(_request_number: int) -> int:
+        return client.post(
+            "/orders", headers=AUTH, json={"lines": [{"sku": sku, "quantity": 1}]}
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        statuses = list(executor.map(place_order, range(12)))
+
+    assert statuses.count(201) == 4
+    assert statuses.count(409) == 8
+    inventory = client.get(f"/inventory/{sku}", headers=AUTH)
+    assert inventory.status_code == 200
+    assert inventory.json()["quantity"] == 0
+
+    with database() as connection:
+        stored_stock = connection.execute(
+            "SELECT stock FROM products WHERE sku = ?", (sku,)
+        ).fetchone()["stock"]
+    assert stored_stock == 0
 
 
 @pytest.mark.parametrize("status", [404, 429, 500])
