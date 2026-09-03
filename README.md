@@ -63,11 +63,20 @@ curl -H 'X-API-Key: zoutkaap-local-demo-key' http://localhost:8000/articles
 | Voorraad | `GET /inventory/{sku}` | Voorraadstand per SKU |
 | Prijzen | `GET /prices` | Alle prijzen in eurocenten |
 | Prijzen | `GET /prices/{sku}` | Prijs per SKU |
-| Orders | `POST /orders` | Order aanmaken en voorraad afboeken |
+| Orders | `POST /orders` | Order aanmaken en voorraad afboeken; ondersteunt `Idempotency-Key` |
 | Orderstatus | `GET /orders/{order_id}/status` | Actuele status van een order |
 | Beheer | `POST /admin/seed` | Data binnen de draaiende service resetten |
 
 De precieze request- en responsemodellen, foutresponses en authenticatie staan altijd actueel in de interactieve OpenAPI-documentatie.
+
+### Orders veilig opnieuw proberen
+
+Geef `POST /orders` een `Idempotency-Key` om een aanvraag veilig opnieuw te kunnen sturen. Een
+herhaling met exact dezelfde gevalideerde requestbody levert dezelfde `201`-response en order-id
+op, boekt geen voorraad af en bevat `Idempotent-Replayed: true`. Dezelfde sleutel met een andere
+requestbody levert `409 Conflict` op. Sleutels blijven in SQLite bewaard totdat
+`POST /admin/seed` (of `python -m app.seed`) de testdata reset. Zonder deze header blijft iedere
+aanvraag een nieuwe order maken.
 
 ## Bewust fouten opwekken
 
