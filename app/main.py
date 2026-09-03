@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
 from collections.abc import AsyncIterator, Iterator
@@ -9,7 +11,7 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Security
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Response, Security
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
@@ -104,6 +106,10 @@ def database() -> Iterator[sqlite3.Connection]:
     connection.row_factory = sqlite3.Row
     try:
         yield connection
+    except Exception:
+        connection.rollback()
+        raise
+    else:
         connection.commit()
     finally:
         connection.close()
@@ -115,6 +121,7 @@ def seed_database() -> SeedResult:
         connection.executescript(
             """
             DROP TABLE IF EXISTS order_lines;
+            DROP TABLE IF EXISTS idempotency_keys;
             DROP TABLE IF EXISTS orders;
             DROP TABLE IF EXISTS products;
             CREATE TABLE products (
@@ -128,6 +135,9 @@ def seed_database() -> SeedResult:
                 order_id INTEGER NOT NULL, sku TEXT NOT NULL, quantity INTEGER NOT NULL,
                 FOREIGN KEY(order_id) REFERENCES orders(id)
             );
+            CREATE TABLE idempotency_keys (
+                key TEXT PRIMARY KEY, request_hash TEXT NOT NULL, response_json TEXT NOT NULL
+            );
             """
         )
         connection.executemany("INSERT INTO products VALUES (?, ?, ?, ?)", PRODUCTS)
@@ -139,6 +149,16 @@ def initialize_database() -> None:
         exists = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'products'"
         ).fetchone()
+        if exists is not None:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS idempotency_keys (
+                    key TEXT PRIMARY KEY,
+                    request_hash TEXT NOT NULL,
+                    response_json TEXT NOT NULL
+                )
+                """
+            )
     if exists is None:
         seed_database()
 
@@ -248,9 +268,58 @@ def get_price(sku: str) -> Price:
     return Price(**dict(row))
 
 
-@router.post("/orders", response_model=Order, status_code=201, tags=["orders"])
-def create_order(request: OrderRequest) -> Order:
+@router.post(
+    "/orders",
+    response_model=Order,
+    status_code=201,
+    tags=["orders"],
+    responses={
+        201: {
+            "description": "Order created, or the original response replayed.",
+            "headers": {
+                "Idempotent-Replayed": {
+                    "description": "True when this is a replay of an earlier request.",
+                    "schema": {"type": "boolean"},
+                }
+            },
+        },
+        409: {
+            "description": "Insufficient stock, or an idempotency key used with another body."
+        },
+    },
+)
+def create_order(
+    request: OrderRequest,
+    response: Response,
+    idempotency_key: Annotated[
+        str | None,
+        Header(
+            alias="Idempotency-Key",
+            description="Retry key. Reusing it with the same body replays the original response.",
+        ),
+    ] = None,
+) -> Order:
+    request_json = json.dumps(request.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    request_hash = hashlib.sha256(request_json.encode()).hexdigest()
+
     with database() as connection:
+        # Reserve the SQLite write lock before checking the key, so concurrent retries
+        # cannot both observe an absent key and create separate orders.
+        connection.execute("BEGIN IMMEDIATE")
+        if idempotency_key is not None:
+            stored = connection.execute(
+                "SELECT request_hash, response_json FROM idempotency_keys WHERE key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if stored is not None:
+                if stored["request_hash"] != request_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Idempotency-Key was already used with a different request body",
+                    )
+                response.headers["Idempotent-Replayed"] = "true"
+                return Order.model_validate_json(stored["response_json"])
+
         quantities: dict[str, int] = {}
         for line in request.lines:
             quantities[line.sku] = quantities.get(line.sku, 0) + line.quantity
@@ -277,7 +346,13 @@ def create_order(request: OrderRequest) -> Order:
             connection.execute(
                 "INSERT INTO order_lines VALUES (?, ?, ?)", (order_id, line.sku, line.quantity)
             )
-    return Order(id=order_id, lines=request.lines)
+        order = Order(id=order_id, lines=request.lines)
+        if idempotency_key is not None:
+            connection.execute(
+                "INSERT INTO idempotency_keys VALUES (?, ?, ?)",
+                (idempotency_key, request_hash, order.model_dump_json()),
+            )
+    return order
 
 
 @router.get("/orders/{order_id}/status", response_model=OrderStatus, tags=["orders"])

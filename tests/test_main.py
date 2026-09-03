@@ -62,6 +62,81 @@ def test_order_status_and_inventory_change(client: TestClient) -> None:
     assert after == before - 2
 
 
+def test_order_replays_same_idempotency_key_without_second_stock_change(
+    client: TestClient,
+) -> None:
+    headers = {**AUTH, "Idempotency-Key": "shop-order-1001"}
+    body = {"lines": [{"sku": "ZK-BROEK-002", "quantity": 2}]}
+
+    first = client.post("/orders", headers=headers, json=body)
+    stock_after_first = client.get("/inventory/ZK-BROEK-002", headers=AUTH).json()["quantity"]
+    replay = client.post("/orders", headers=headers, json=body)
+
+    assert first.status_code == replay.status_code == 201
+    assert replay.json() == first.json()
+    assert "Idempotent-Replayed" not in first.headers
+    assert replay.headers["Idempotent-Replayed"] == "true"
+    assert client.get("/inventory/ZK-BROEK-002", headers=AUTH).json()["quantity"] == stock_after_first
+
+
+def test_order_rejects_idempotency_key_reused_with_different_body(client: TestClient) -> None:
+    headers = {**AUTH, "Idempotency-Key": "shop-order-1002"}
+    first = client.post(
+        "/orders", headers=headers, json={"lines": [{"sku": "ZK-JAS-001", "quantity": 1}]}
+    )
+    conflict = client.post(
+        "/orders", headers=headers, json={"lines": [{"sku": "ZK-JAS-001", "quantity": 2}]}
+    )
+
+    assert first.status_code == 201
+    assert conflict.status_code == 409
+    assert "different request body" in conflict.json()["detail"]
+    assert client.get("/inventory/ZK-JAS-001", headers=AUTH).json()["quantity"] == 41
+
+
+def test_idempotency_key_survives_application_restart() -> None:
+    headers = {**AUTH, "Idempotency-Key": "shop-order-persistent"}
+    body = {"lines": [{"sku": "ZK-TRUI-001", "quantity": 1}]}
+    with TestClient(app) as first_client:
+        first = first_client.post("/orders", headers=headers, json=body)
+
+    with TestClient(app) as restarted_client:
+        replay = restarted_client.post("/orders", headers=headers, json=body)
+        stock = restarted_client.get("/inventory/ZK-TRUI-001", headers=AUTH)
+
+    assert replay.json() == first.json()
+    assert replay.headers["Idempotent-Replayed"] == "true"
+    assert stock.json()["quantity"] == 19
+
+
+def test_orders_without_idempotency_key_keep_creating_orders(client: TestClient) -> None:
+    body = {"lines": [{"sku": "ZK-TAS-001", "quantity": 1}]}
+    first = client.post("/orders", headers=AUTH, json=body)
+    second = client.post("/orders", headers=AUTH, json=body)
+
+    assert first.status_code == second.status_code == 201
+    assert first.json()["id"] != second.json()["id"]
+    assert client.get("/inventory/ZK-TAS-001", headers=AUTH).json()["quantity"] == 30
+
+
+def test_concurrent_retries_with_same_key_create_one_order(client: TestClient) -> None:
+    headers = {**AUTH, "Idempotency-Key": "shop-order-concurrent"}
+    body = {"lines": [{"sku": "ZK-LAARS-001", "quantity": 2}]}
+
+    def place_order(_request_number: int):
+        return client.post("/orders", headers=headers, json=body)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        responses = list(executor.map(place_order, range(8)))
+
+    assert {response.status_code for response in responses} == {201}
+    assert len({response.json()["id"] for response in responses}) == 1
+    assert sum(response.headers.get("Idempotent-Replayed") == "true" for response in responses) == 7
+    assert client.get("/inventory/ZK-LAARS-001", headers=AUTH).json()["quantity"] == 8
+    with database() as connection:
+        assert connection.execute("SELECT COUNT(*) AS count FROM orders").fetchone()["count"] == 1
+
+
 def test_order_rejects_insufficient_stock(client: TestClient) -> None:
     response = client.post(
         "/orders", headers=AUTH, json={"lines": [{"sku": "ZK-MUTS-003", "quantity": 1}]}
@@ -119,13 +194,21 @@ def test_forced_errors(client: TestClient, status: int) -> None:
 def test_seed_restores_state(client: TestClient) -> None:
     client.post(
         "/orders",
-        headers=AUTH,
+        headers={**AUTH, "Idempotency-Key": "order-before-reset"},
         json={"lines": [{"sku": "ZK-JAS-001", "quantity": 2}]},
     )
     result = client.post("/admin/seed", headers=AUTH)
     assert result.json() == {"products": 24, "orders": 0}
     assert client.get("/inventory/ZK-JAS-001", headers=AUTH).json()["quantity"] == 42
     assert client.get("/orders/1/status", headers=AUTH).status_code == 404
+    after_reset = client.post(
+        "/orders",
+        headers={**AUTH, "Idempotency-Key": "order-before-reset"},
+        json={"lines": [{"sku": "ZK-JAS-001", "quantity": 2}]},
+    )
+    assert after_reset.status_code == 201
+    assert "Idempotent-Replayed" not in after_reset.headers
+    assert client.get("/inventory/ZK-JAS-001", headers=AUTH).json()["quantity"] == 40
 
 
 def test_generated_openapi_is_valid_and_documents_all_domains(client: TestClient) -> None:
@@ -134,3 +217,11 @@ def test_generated_openapi_is_valid_and_documents_all_domains(client: TestClient
     for path in ("/articles", "/inventory", "/prices", "/orders/{order_id}/status"):
         assert path in spec["paths"]
     assert "APIKeyHeader" in spec["components"]["securitySchemes"]
+    create_order = spec["paths"]["/orders"]["post"]
+    idempotency_header = next(
+        parameter for parameter in create_order["parameters"] if parameter["name"] == "Idempotency-Key"
+    )
+    assert idempotency_header["in"] == "header"
+    assert "201" in create_order["responses"]
+    assert "Idempotent-Replayed" in create_order["responses"]["201"]["headers"]
+    assert "409" in create_order["responses"]
