@@ -1,20 +1,12 @@
 # zoutkaap-erp-mock
 
-ERP-nabootsing van Zoutkaap: een echte, draaiende REST-service met een automatisch gegenereerde OpenAPI-beschrijving voor producten, voorraad en orders.
+Een echte, lokaal draaiende REST-nabootsing van het fictieve Zoutkaap-ERP. De service bevat een deterministische catalogus met 24 testartikelen en persistente SQLite-data voor artikelen, voorraad, prijzen en orders.
 
-## Doel
-
-Zoutkaap verkoopt zoutwaterbestendige buitenkleding via een eigen Shopify-webshop, maar voorraad en orders worden nu met de hand overgetikt tussen de shop en het ERP. Deze service bootst dat ERP na, zodat `zoutkaap-erp-bridge` (de middleware) er een echte voorraadsync en orderdoorgifte tegenaan kan bouwen en testen, inclusief foutscenario's, zonder dat er een echt ERP-contract nodig is.
-
-## Klant
-
-[Zoutkaap](https://github.com/raderwerk) is een demonstratiebedrijf van Raderwerk en bestaat niet. Zie `raderwerk/hq` voor het volledige klantdossier.
-
-## Stack
-
-Python 3.12 + [FastAPI](https://fastapi.tiangolo.com/). Gekozen omdat FastAPI de OpenAPI-beschrijving die dit project als kernvereiste heeft (producten, voorraad, orders) automatisch uit de code genereert (`/openapi.json`, interactief op `/docs`), in plaats van dat die spec los onderhouden moet worden.
+> Zoutkaap is een demonstratiebedrijf van Raderwerk en bestaat niet. Alle data en de API-sleutel in deze repository zijn uitsluitend lokale testdata.
 
 ## Lokaal draaien
+
+Python 3.12 of nieuwer is vereist.
 
 ```bash
 python3 -m venv .venv
@@ -23,22 +15,78 @@ pip install -e ".[dev]"
 uvicorn app.main:app --reload --port 8000
 ```
 
-De service draait dan op poort **8000**. Interactieve documentatie op `http://localhost:8000/docs`, de ruwe OpenAPI-spec op `http://localhost:8000/openapi.json`.
+De API draait vervolgens op `http://localhost:8000`. De interactieve documentatie staat op [`/docs`](http://localhost:8000/docs); de uit de routes gegenereerde en geteste OpenAPI-beschrijving staat op [`/openapi.json`](http://localhost:8000/openapi.json). Er wordt bewust geen tweede, handmatig bijgehouden OpenAPI-bestand opgeslagen.
 
-## Checks draaien
+Standaard wordt de SQLite-database geschreven naar `instance/zoutkaap.sqlite3`. Dit pad is instelbaar met `ZOUTKAAP_DATABASE`.
+
+## Authenticatie
+
+Alle bedrijfs- en beheerroutes vereisen de header:
+
+```http
+X-API-Key: zoutkaap-local-demo-key
+```
+
+Dit is een publieke ontwikkelsleutel, **geen geheim of productiecredential**. Stel voor een andere lokale waarde de omgevingsvariabele `ZOUTKAAP_API_KEY` in voordat de server start. Een ontbrekende of onjuiste sleutel geeft `401 Unauthorized`. Alleen `/health`, `/docs` en `/openapi.json` zijn publiek.
+
+Voorbeeld:
+
+```bash
+curl -H 'X-API-Key: zoutkaap-local-demo-key' http://localhost:8000/articles
+```
+
+## REST-routes
+
+| Domein | Methode en route | Gedrag |
+| --- | --- | --- |
+| Artikelen | `GET /articles` | Alle 24 artikelen |
+| Artikelen | `GET /articles/{sku}` | Eén artikel |
+| Voorraad | `GET /inventory` | Alle voorraadstanden |
+| Voorraad | `GET /inventory/{sku}` | Voorraadstand per SKU |
+| Prijzen | `GET /prices` | Alle prijzen in eurocenten |
+| Prijzen | `GET /prices/{sku}` | Prijs per SKU |
+| Orders | `POST /orders` | Order aanmaken en voorraad afboeken |
+| Orderstatus | `GET /orders/{order_id}/status` | Actuele status van een order |
+| Beheer | `POST /admin/seed` | Data binnen de draaiende service resetten |
+
+De precieze request- en responsemodellen, foutresponses en authenticatie staan altijd actueel in de interactieve OpenAPI-documentatie.
+
+## Bewust fouten opwekken
+
+Stuur op een geauthenticeerde route de testheader `X-Test-Status` met exact `404`, `429` of `500`. De API antwoordt dan onmiddellijk met die status. Een geforceerde `429` bevat altijd `Retry-After: 2`.
+
+```bash
+curl -i \
+  -H 'X-API-Key: zoutkaap-local-demo-key' \
+  -H 'X-Test-Status: 429' \
+  http://localhost:8000/articles
+```
+
+Andere waarden zijn ongeldig en leveren FastAPI's reguliere `422`-validatiefout op. De testheader is ook als parameter zichtbaar in de OpenAPI-beschrijving.
+
+## Startstaat herstellen
+
+Herstel in één commando de 24 oorspronkelijke artikelen en voorraadstanden en verwijder alle orders:
+
+```bash
+python -m app.seed
+```
+
+Het commando gebruikt hetzelfde `ZOUTKAAP_DATABASE`-pad als de service. Voor een reeds draaiende service kan hetzelfde atomair met:
+
+```bash
+curl -X POST -H 'X-API-Key: zoutkaap-local-demo-key' http://localhost:8000/admin/seed
+```
+
+## Checks
 
 ```bash
 ruff check .
 pytest -q
 ```
 
-Beide moeten slagen voordat je een pull request opent; de `ci`-workflow draait exact dezelfde twee commando's.
+Deze commando's zijn gelijk aan de CI-checks. De tests dekken onder andere authenticatie, alle vier domeinen, order/voorraadgedrag, alle drie geforceerde fouten, de `Retry-After`-header, resetgedrag en validatie van de gegenereerde OpenAPI-beschrijving.
 
-## Bijdragen via PR
+## Bijdragen
 
-1. Vertak vanaf `main`.
-2. Draai `ruff check .` en `pytest -q` lokaal; los alles op voordat je pusht.
-3. Open een pull request met het sjabloon (wat, waarom, bewijs, DoD-checklist).
-4. `main` is beschermd: een pull request met een geslaagde `ci`-check is verplicht. Een mens keurt goed en merget; agents mergen nooit zelf.
-
-Zie `AGENTS.md` voor de volledige scope, Definition of Done en verboden acties voor AI-agents die aan deze repo werken.
+Werk via een feature- of fix-branch en open een pull request naar `main`. Een mens keurt goed en merget; agents mergen en deployen nooit. Zie `AGENTS.md` en `CLAUDE.md` voor alle werkafspraken.
